@@ -1,0 +1,202 @@
+---
+title: "TOTVS Challenge"
+output: html_document
+---
+
+### 1. Parse and extract the data
+
+Running the script found in "scripts/data_loader.py" will parse, extract and load the data into a relational postgres database.
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+library(ggplot2)
+library(lubridate)
+library(tidyr)
+library(forecast)
+library(knitr)
+require("RPostgreSQL")
+
+# Settting directory
+setwd("~/Documents/github_portfolio/totvs/analysis")
+
+# Setting constants
+img_path <- "/viz/"
+plot_color <- "darkblue"
+```
+
+
+#### Reading data from database
+```{r, echo=TRUE, message = FALSE, warning=FALSE}
+
+# runs a script contain the username and password for the database
+source("../scripts/my_pass.r")
+
+# loads the PostgreSQL driver
+drv <- dbDriver("PostgreSQL")
+
+# creates a connection to the postgres database
+con <- dbConnect(drv, dbname = "postgres",
+                 host = "localhost", port = 5432,
+                 user = username, password = pw)
+
+# query daily sales
+query <- "select date_str, sum(units * sales.unit_price) as revenue  from totvs.sales GROUP BY date_str;"
+sales <- dbGetQuery(con, query)
+
+# query daily sales per product
+query <- "select product, date_str, sum(units) as units, sum(units * sales.unit_price) as revenue  from totvs.sales GROUP BY product, date_str;"
+prod_sales <- dbGetQuery(con, query)
+
+# query total sales per product per price
+query <- "select product, unit_price, sum(units) as units from totvs.sales GROUP BY product, unit_price;"
+price_sales <- dbGetQuery(con, query)
+
+# Removing variables
+rm(con,drv,pw,username,query)
+```
+
+
+#### Data Treatment
+```{r, echo=TRUE, message = FALSE, warning=FALSE}
+sales$date_order <- as.Date(sales$date_str)
+prod_sales$date_order <- as.Date(prod_sales$date_str)
+
+sales$day_week <- wday(sales$date_order, label = TRUE, abbr = TRUE)
+prod_sales$day_week <- wday(prod_sales$date_order, label = TRUE, abbr = TRUE)
+```
+
+
+### 2. Identify a pattern on any set of fields that can help predict how much a customer will spend.
+
+
+#### Impact of day of the week in sales
+
+It's known that the day of the week has a major impact on sales across multiple industries. In this restaurant it's not different and the bar plot below depicts just that.
+```{r, echo=TRUE, message = FALSE, warning=FALSE}
+weekday_sales <- aggregate(x = list(revenue = sales$revenue), 
+                           by = list(day_week = sales$day_week), 
+                           FUN = mean, na.rm = TRUE)
+
+my_title <-"Average Revenue Sold \n"
+p <- ggplot(weekday_sales, aes(day_week, revenue)) + theme_bw()
+p <- p + geom_bar(fill = "black", stat = "identity") 
+p <- p + labs(title = my_title, x = "Day of the Week", y = "Revenue")
+p <- p + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+p
+
+```
+
+#### Price Elasticity
+
+The idea here is to see how the price impacts the sales of each product. Because many products did not change prices, most plots are not informative.
+
+```{r, echo=TRUE, message = FALSE, warning=FALSE, fig.width=9}
+p <- ggplot(price_sales, aes(unit_price, units)) + geom_point(size = 1.5)
+p <- p + theme_bw()  
+p <- p + labs(title = "Quantity x Price \n", x = "Price", y = "Quantity")
+p <- p + facet_wrap(~product, scales = "free")
+p <- p + geom_smooth(se = FALSE, colour = plot_color)
+p
+```
+
+## 3. Calculate a sales forecast for the next week.
+
+### Time Series
+
+This is the Daily Revenue over time.
+```{r, echo=TRUE, message = FALSE, warning=FALSE, fig.width=9}
+p <- ggplot(sales, aes(date_order, revenue)) 
+p <- p + geom_line(colour = plot_color) + geom_point(colour ="black", size = 1)
+p <- p + labs(title = "Daily Revenue \n", x = "", y = "Dollars")
+p <- p + theme_bw()
+p
+```
+
+In this plot I broke down the revenue per product. With more time I would group some of them into categories and then do the forecast for each group. Another issue is the lack of data for certain products. With more data I could even have a prediction per product, although I still believe grouping them into categories would yield a better result.
+
+```{r, echo=TRUE, message = FALSE, warning=FALSE, fig.width=9}
+# Daily revenue per product
+p <- ggplot(prod_sales, aes(date_order, revenue)) 
+p <- p + geom_line(colour = plot_color) + geom_point(colour ="black", size = 1)
+p <- p + labs(title = "Daily Revenue by Product \n", x = "", y = "Dollars")
+p <- p + theme(axis.text.x=element_blank()) + facet_wrap(~product, scales = "free_y")
+p
+```
+
+### Model Selection
+```{r, echo=TRUE, message = FALSE, warning=FALSE}
+library("tseries")
+my_ts <- ts(sales[order(sales$date_order),"revenue"])
+```
+
+Checking for stationarity
+```{r, echo=TRUE, message = FALSE, warning=FALSE}
+adf.test(my_ts, k=2)
+```
+
+The test indicates the time series is stationary, so there is no need for differencing.
+
+ACF and PACF plots
+```{r, echo=TRUE, message = FALSE, warning=FALSE}
+acf(my_ts)
+pacf(my_ts)
+```
+
+The seasonality of 6 days was more than expected. We will remove the seasonal component and then check the ACF and PACF again.
+
+```{r, echo=TRUE, message = FALSE, warning=FALSE}
+dmy_ts <- diff(my_ts, lag = 6)
+adf.test(dmy_ts)
+acf(dmy_ts)
+pacf(dmy_ts)
+```
+
+After removing seasonality there is no statistically significant auto-regressive or moving averages component.
+
+#### Fitting Model
+```{r, echo=TRUE, message = FALSE, warning=FALSE}
+my_model <- arima(my_ts, order = c(0,0,0), seasonal = list(order = c(0,1,1), period = 6))
+```
+
+#### Normality check
+```{r, echo=TRUE, message = FALSE, warning=FALSE}
+e <- my_model$residuals
+shapiro.test(e)
+```
+
+#### Autocorrelation
+```{r, echo=FALSE, fig.height=10, fig.width=9}
+tsdiag(my_model)
+```
+
+The Shapiro test rejects the null hypothesis that the errors are normally distributed and Autocorrelation test show that there is still autocorrelation inside the residuals. This is far from ideal but I will proceed with this model for now.
+
+#### Forecast for next week
+```{r, echo=TRUE, message = FALSE, warning=FALSE}
+forecast <- predict(my_model, n.ahead = 6, plot = T, conf = 0.95)
+```
+
+#### Plotting Forecast
+
+```{r, echo=TRUE, message = FALSE, warning=FALSE}
+pred_days <- seq(as.Date("2016-01-25"), as.Date("2016-01-30"), by="days")
+pred_revenue <- forecast$pred
+sales$type <- "real_data"
+pred <- data.frame(date_order = pred_days, revenue = pred_revenue, type = "prediction")
+
+df <- rbind(sales[,c("date_order","revenue","type")], pred)
+```
+
+```{r, echo=TRUE, message = FALSE, warning=FALSE , fig.width=9}
+# Daily revenue
+p <- ggplot(df, aes(date_order, revenue)) 
+p <- p + geom_line(colour = plot_color) + geom_point(aes(colour = type), size = 2)
+p <- p + labs(title = "Forescat Revenue \n", x = "", y = "Dollars")
+p <- p + theme_bw() 
+p
+```
+
+Total Revenue for next week in [Reais]
+```{r, echo=TRUE, message = FALSE, warning=FALSE}
+sum(forecast$pred)
+```
+
